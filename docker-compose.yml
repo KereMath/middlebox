@@ -95,6 +95,27 @@ services:
     - NATS_SURVEYOR_SERVERS=${NATS_SURVEYOR_SERVERS}
 
 
+    
+  random-delay-processor:
+    build: ./dockers/random-delay-processor
+    init: true
+    container_name: random-delay-processor
+    networks:
+      intnet: {}
+    command: ["python", "/code/random-delay-processor/processor.py"]
+    volumes:
+      - ./config:/config
+      - ./code/random-delay-processor:/code/random-delay-processor
+    environment:
+      - SECURE_NET=${SECURE_NET}
+      - SECURENET_GATEWAY=${SECURENET_GATEWAY}
+      - INSECURE_NET=${INSECURE_NET}
+      - INSECURENET_GATEWAY=${INSECURENET_GATEWAY}
+      - SECURENET_HOST_IP=${SECURENET_HOST_IP}
+      - INSECURENET_HOST_IP=${INSECURENET_HOST_IP}
+      - NATS_SURVEYOR_SERVERS=${NATS_SURVEYOR_SERVERS}
+      - DELAY_VALUE=500
+        
   insec:
     build: ./dockers/insec
     init: true
