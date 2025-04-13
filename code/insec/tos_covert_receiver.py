@@ -1,267 +1,205 @@
 #!/usr/bin/env python3
-
 import argparse
-import socket
 import time
-import os
 import sys
-import struct
-import binascii
 import signal
-from collections import Counter, deque
-from scapy.all import sniff, IP, UDP
+from collections import Counter
+from statistics import mean, stdev
+from scapy.all import sniff, IP, UDP, Raw
 
-parser = argparse.ArgumentParser(description='TOS Covert Channel Receiver')
+parser = argparse.ArgumentParser(description='TOS Covert Channel Receiver with Header and Performance Measurement')
 parser.add_argument('--tos-mapping-bits', type=int, default=3, 
-                    help='Number of bits used in TOS field (1-8)')
+                    help='TOS alanında kullanılacak bit sayısı (1-8)')
 parser.add_argument('--port', type=int, default=8888, 
-                    help='UDP port to listen on')
-parser.add_argument('--mode', choices=['live', 'experiment'], default='live',
-                    help='Receiver mode: live decoding or experiment measurements')
-parser.add_argument('--timeout', type=int, default=60,
-                    help='Timeout in seconds to stop if no packets received')
+                    help='Dinlenecek UDP portu')
+parser.add_argument('--timeout', type=int, default=180,
+                    help='Paket alınamadığında durması için timeout (saniye)')
 parser.add_argument('--packets-per-symbol', type=int, default=1,
-                    help='Expected packets per symbol (for redundancy)')
-parser.add_argument('--log-file', type=str, default='tos_covert_receiver.log',
-                    help='File to log results to in experiment mode')
-parser.add_argument('--simple-coding', action='store_true',
-                    help='Use simpler character-based decoding (for reliability)')
-
+                    help='Her sembol için beklenen paket sayısı (redundancy)')
+parser.add_argument('--iface', type=str, default="eth0", 
+                    help="Dinlenecek ağ arayüzü")
 args = parser.parse_args()
 
 class TOSCovertReceiver:
-    def __init__(self, bits_per_symbol, port, packets_per_symbol=1, simple_coding=False):
+    def __init__(self, bits_per_symbol, port, packets_per_symbol=1):
         self.bits_per_symbol = bits_per_symbol
         self.port = port
         self.packets_per_symbol = packets_per_symbol
-        self.max_value = (1 << bits_per_symbol) - 1
-        self.simple_coding = simple_coding
+        # Durumlar: "waiting", "header", "payload", "complete"
+        self.state = "waiting"
         
-        self.start_value = self.max_value - 1 if self.max_value > 1 else 1
-        self.end_value = self.max_value if self.max_value > 1 else 0
+        # Header için sabit uzunluk: en az 16 bit -> bits_per_symbol’a göre yukarı yuvarlanır.
+        self.header_symbol_count = -(-16 // self.bits_per_symbol)
+        self.header_symbols = []  # Header kısmında toplanan semboller
+        self.payload_symbols = []  # Payload kısmında toplanan semboller
         
-        self.received_tos_values = []
+        # Redundans için geçici sembol buffer
         self.symbol_buffer = []
-        self.message_buffer = []
+        self.current_symbol_count = 0
         
-        self.packets_received = 0
-        self.symbols_received = 0
+        self.payload_count_expected = None  # Header'dan belirlenecek payload sembol sayısı
+        
         self.start_time = None
         self.end_time = None
         self.last_packet_time = None
+
+        # Alınan mesajların performans ölçümleri: [(mesaj süresi, throughput), ...]
+        self.performance_results = []
+
+    def reset(self):
         self.state = "waiting"
-        
+        self.header_symbols = []
+        self.payload_symbols = []
+        self.symbol_buffer = []
         self.current_symbol_count = 0
-        
-        print(f"TOS Covert Receiver initialized with {bits_per_symbol} bits per symbol")
-        print(f"Listening on UDP port {port}")
-        print(f"Using {packets_per_symbol} packets per symbol for redundancy")
-        print(f"Start marker: {self.start_value}, End marker: {self.end_value}")
-        print(f"Simple coding mode: {self.simple_coding}")
-    
+        self.payload_count_expected = None
+        self.start_time = None
+        self.end_time = None
+
+    def process_control(self, payload):
+        if payload == b"START":
+            if self.state == "waiting":
+                print("START sinyali alındı. HEADER durumuna geçiliyor.")
+                self.state = "header"
+                self.header_symbols = []
+                self.symbol_buffer = []
+                self.current_symbol_count = 0
+            else:
+                print(f"Ek START sinyali alındı (durum: {self.state}); yoksayılıyor.")
+        elif payload == b"END":
+            # END paketlerini yalnızca payload tamamlanmışsa işleyelim.
+            if self.state == "header":
+                print("END sinyali alındı ancak header tamamlanmadı; yoksayılıyor.")
+            elif self.state == "payload":
+                if self.payload_count_expected is None or len(self.payload_symbols) < self.payload_count_expected:
+                    print("END sinyali alındı ancak payload tamamlanmadı; yoksayılıyor.")
+                else:
+                    print("END sinyali alındı, mesaj tamamlandı.")
+                    self.state = "complete"
+                    self.end_time = time.time()
+                    self.process_received_data()
+            else:
+                # waiting veya complete durumunda kontrol paketleri yoksayılıyor.
+                pass
+
+    def add_symbol(self, symbol_value, target_list):
+        self.symbol_buffer.append(symbol_value)
+        self.current_symbol_count += 1
+        if self.current_symbol_count >= self.packets_per_symbol:
+            most_common_value = Counter(self.symbol_buffer).most_common(1)[0][0]
+            target_list.append(most_common_value)
+            self.symbol_buffer = []
+            self.current_symbol_count = 0
+
     def packet_handler(self, packet):
-        if not (packet.haslayer(IP) and packet.haslayer(UDP) and packet[UDP].dport == self.port):
+        if not (packet.haslayer(IP) and packet.haslayer(UDP) and packet.haslayer(Raw) and packet[UDP].dport == self.port):
             return
         
         tos_value = packet[IP].tos
-        
-        print(f"Received packet with TOS: {tos_value}, Source: {packet[IP].src}")
-        
-        self.packets_received += 1
-        current_time = time.time()
-        self.last_packet_time = current_time
-        
+        payload = packet[Raw].load
+        self.last_packet_time = time.time()
         if self.start_time is None:
-            self.start_time = current_time
-            
-        if self.state == "waiting":
-            if tos_value == self.start_value:
-                print("Start marker detected, beginning to receive data")
-                self.state = "receiving"
-                self.received_tos_values = []
-            
-        elif self.state == "receiving":
-            if tos_value == self.end_value:
-                self.state = "complete"
-                self.end_time = current_time
-                self.process_received_data()
-                return
-                
-            self.symbol_buffer.append(tos_value)
-            self.current_symbol_count += 1
-            
-            if self.current_symbol_count >= self.packets_per_symbol:
-                if self.packets_per_symbol > 1:
-                    most_common_value = Counter(self.symbol_buffer).most_common(1)[0][0]
-                    self.received_tos_values.append(most_common_value)
-                else:
-                    self.received_tos_values.append(tos_value)
-                
-                self.symbols_received += 1
-                self.symbol_buffer = []
-                self.current_symbol_count = 0
-                
-                if self.symbols_received % 10 == 0:
-                    print(f"Received {self.symbols_received} symbols so far...")
-    
-    def decode_binary_to_message(self, tos_values):
-        binary_string = ''
-        for value in tos_values:
-            binary = format(value, f'0{self.bits_per_symbol}b')
-            binary_string += binary
-        
-        print(f"Binary string: {binary_string}")
-        
-        decoded_message = ''
-        for i in range(0, len(binary_string), 8):
-            if i + 8 <= len(binary_string):
-                byte = binary_string[i:i+8]
-                try:
-                    char_code = int(byte, 2)
-                    decoded_char = chr(char_code)
-                    decoded_message += decoded_char
-                    print(f"Byte: {byte}, Code: {char_code}, Char: {decoded_char}")
-                except ValueError:
-                    decoded_message += '?'
-                    print(f"Invalid byte: {byte}")
-                except Exception as e:
-                    decoded_message += '?'
-                    print(f"Error processing byte {byte}: {e}")
-        
-        return decoded_message
-    
-    def decode_simple_coding(self, tos_values):
-        decoded_message = ''
-        char_code = 0
-        
-        for value in tos_values:
-            if value == self.start_value:
-                continue
-                
-            if value == self.max_value:
-                char_code += value
-            else:
-                char_code += value
-                try:
-                    decoded_message += chr(char_code)
-                    print(f"Code: {char_code}, Char: {chr(char_code)}")
-                except Exception as e:
-                    decoded_message += '?'
-                    print(f"Error with code {char_code}: {e}")
-                char_code = 0
-        
-        return decoded_message
-        
-    def process_received_data(self):
-        print(f"\nReceived {len(self.received_tos_values)} symbols ({self.packets_received} packets total)")
-        
-        print(f"Received TOS values: {self.received_tos_values}")
-        
-        if self.simple_coding:
-            decoded_message = self.decode_simple_coding(self.received_tos_values)
-        else:
-            decoded_message = self.decode_binary_to_message(self.received_tos_values)
-        
-        print(f"Decoded message: '{decoded_message}'")
-        self.message_buffer.append(decoded_message)
-        
-        transmission_time = self.end_time - self.start_time
-        bits_received = len(self.received_tos_values) * self.bits_per_symbol
-        capacity = bits_received / transmission_time if transmission_time > 0 else 0
-        
-        print(f"Transmission time: {transmission_time:.2f} seconds")
-        print(f"Bits received: {bits_received}")
-        print(f"Channel capacity: {capacity:.2f} bits/second")
-        
-        self.state = "waiting"
-        
-        return decoded_message, bits_received, transmission_time, capacity
-    
-    def start_capturing(self, timeout=60):
-        print(f"Starting packet capture on UDP port {self.port} on interface eth0...")
-        print(f"Will timeout after {timeout} seconds of inactivity")
-        
-        def handle_timeout(signum, frame):
-            if self.state == "receiving" and self.received_tos_values:
-                print("\nTimeout while receiving data, processing available data...")
+            self.start_time = self.last_packet_time
+
+        # Kontrol paketleri
+        if payload in [b"START", b"END"]:
+            self.process_control(payload)
+            return
+
+        # Duruma bağlı işleme:
+        if self.state == "header" and payload == b"HEADER":
+            self.add_symbol(tos_value, self.header_symbols)
+            if len(self.header_symbols) == self.header_symbol_count:
+                header_binary = ''.join(format(s, f'0{self.bits_per_symbol}b') for s in self.header_symbols)
+                self.payload_count_expected = int(header_binary, 2)
+                print(f"Header alındı. {self.payload_count_expected} payload sembolü bekleniyor.")
+                self.state = "payload"
+        elif self.state == "payload" and payload == b"DATA":
+            self.add_symbol(tos_value, self.payload_symbols)
+            if self.payload_count_expected is not None and len(self.payload_symbols) == self.payload_count_expected:
                 self.state = "complete"
                 self.end_time = time.time()
                 self.process_received_data()
-            else:
-                print("\nTimeout reached with no data received.")
-            
-            print("Capture stopped.")
+
+    def decode_binary_to_message(self, symbols):
+        binary_string = ''.join(format(value, f'0{self.bits_per_symbol}b') for value in symbols)
+        decoded_message = ''
+        for i in range(0, len(binary_string) - (len(binary_string) % 8), 8):
+            byte = binary_string[i:i+8]
+            try:
+                decoded_message += chr(int(byte, 2))
+            except Exception:
+                decoded_message += '?'
+        return decoded_message
+
+    def process_received_data(self):
+        if not self.payload_symbols:
+            print("Hiç payload sembolü alınamadı.")
+            return
+        message = self.decode_binary_to_message(self.payload_symbols)
+        duration = self.end_time - self.start_time if self.end_time and self.start_time else 0
+        # Payload'da (header'da belirlenen) sembol sayısı * bits_per_symbol = toplam bit sayısı
+        payload_bits = self.payload_count_expected * self.bits_per_symbol if self.payload_count_expected else 0
+        throughput = payload_bits / duration if duration > 0 else 0
+        print("\nAlınan ve çözümlenen mesaj:")
+        print(message)
+        print(f"Mesaj süresi: {duration:.3f} saniye, Kapasite: {throughput:.3f} bit/s")
+        self.performance_results.append((duration, throughput))
+        self.reset()
+
+    def print_performance(self):
+        if not self.performance_results:
+            print("Hiç mesaj alınmadı, performans ölçümü yapılamadı.")
+            return
+        durations = [r[0] for r in self.performance_results]
+        throughputs = [r[1] for r in self.performance_results]
+        n = len(self.performance_results)
+        avg_duration = mean(durations)
+        avg_throughput = mean(throughputs)
+        if n > 1:
+            ci_duration = 1.96 * stdev(durations) / (n**0.5)
+            ci_throughput = 1.96 * stdev(throughputs) / (n**0.5)
+        else:
+            ci_duration = 0
+            ci_throughput = 0
+        print("\n***** Performans Özeti *****")
+        print(f"Alınan mesaj sayısı: {n}")
+        print(f"Ortalama süre: {avg_duration:.3f} ± {ci_duration:.3f} saniye")
+        print(f"Ortalama kapasite: {avg_throughput:.3f} ± {ci_throughput:.3f} bit/s")
+        print("******************************\n")
+
+    def start_capturing(self, timeout=180):
+        def handle_timeout(signum, frame):
+            print("Timeout gerçekleşti. Yakalama durduruluyor.")
+            if self.state in ["header", "payload"]:
+                print("Eksik mesaj alınmış. Durum sıfırlanıyor.")
+                self.reset()
+            self.print_performance()
             sys.exit(0)
         
         signal.signal(signal.SIGALRM, handle_timeout)
         signal.alarm(timeout)
         
         try:
-            sniff(prn=self.packet_handler, filter=f"udp port {self.port}", iface="eth0", store=0)
+            sniff(prn=self.packet_handler, filter=f"udp port {self.port}", iface=args.iface, store=0)
         except KeyboardInterrupt:
-            print("\nCapture stopped by user.")
-            if self.state == "receiving" and self.received_tos_values:
-                print("Processing available data...")
-                self.state = "complete"
-                self.end_time = time.time()
-                self.process_received_data()
-
-def run_experiment_mode():
-    print("Running in experiment mode to collect performance metrics")
-    
-    log_file = open(args.log_file, 'w')
-    log_file.write("bits_per_symbol,packets_per_symbol,packets_received,symbols_received,bits_received,transmission_time,capacity\n")
-    
-    receiver = TOSCovertReceiver(
-        args.tos_mapping_bits, 
-        args.port, 
-        args.packets_per_symbol,
-        args.simple_coding
-    )
-    
-    messages = []
-    
-    def experiment_packet_handler(packet):
-        receiver.packet_handler(packet)
-        
-        if receiver.state == "complete":
-            message, bits, time_taken, capacity = receiver.process_received_data()
-            messages.append(message)
-            
-            log_file.write(f"{args.tos_mapping_bits},{args.packets_per_symbol},"
-                          f"{receiver.packets_received},{receiver.symbols_received},"
-                          f"{bits},{time_taken:.6f},{capacity:.6f}\n")
-            log_file.flush()
-            
-            receiver.state = "waiting"
-    
-    try:
-        print(f"Starting experiment. Results will be logged to {args.log_file}")
-        print("Press Ctrl+C to stop the experiment")
-        
-        sniff(prn=experiment_packet_handler, filter=f"udp port {args.port}", iface="eth0", store=0)
-    
-    except KeyboardInterrupt:
-        print("\nExperiment stopped by user.")
-        log_file.close()
-        
-        print(f"\nReceived {len(messages)} complete messages")
-        if messages:
-            print(f"First message: '{messages[0]}'")
-            if len(messages) > 1:
-                print(f"Last message: '{messages[-1]}'")
+            print("\nKlavye kesintisi tespit edildi. Son performans bilgileri:")
+            self.print_performance()
+            sys.exit(0)
 
 def main():
-    if args.mode == 'experiment':
-        run_experiment_mode()
-    else:
-        receiver = TOSCovertReceiver(
-            args.tos_mapping_bits, 
-            args.port, 
-            args.packets_per_symbol,
-            args.simple_coding
-        )
-        receiver.start_capturing(args.timeout)
+    # Test konfigürasyon parametrelerini yazdır
+    print("=== Receiver Test Configuration ===")
+    print(f"TOS Mapping Bits      : {args.tos_mapping_bits}")
+    print(f"Redundancy (Packets/Symbol): {args.packets_per_symbol}")
+    print(f"UDP Port              : {args.port}")
+    print(f"Timeout (s)           : {args.timeout}")
+    print(f"Interface             : {args.iface}")
+    print("=====================================\n")
+    
+    receiver = TOSCovertReceiver(args.tos_mapping_bits, args.port, args.packets_per_symbol)
+    print("TOS Covert Channel Receiver başlatılıyor...")
+    receiver.start_capturing(args.timeout)
 
 if __name__ == "__main__":
     main()
