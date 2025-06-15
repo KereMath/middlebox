@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# simple_detector.py - NumPy gerektirmeyen basit detector
+# simple_detector.py - v2 (FP hatası düzeltildi)
 import asyncio
 from nats.aio.client import Client as NATS
 import os
@@ -50,47 +50,57 @@ class SimpleTOSDetector:
             packet = Ether(msg.data)
             self.metrics["packets"] += 1
             
-            detected = False
-            
             if packet.haslayer(IP) and packet.haslayer(UDP):
                 tos = packet[IP].tos
                 self.tos_history.append(tos)
                 
-                # Control packet kontrolü
+                # --- 1. Bilgi Toplama Aşaması ---
+                is_start_packet = False
+                is_end_packet = False
+                detected_by_payload = False
+
                 if packet.haslayer(Raw):
                     payload = packet[Raw].load
                     if payload == b"START":
-                        self.covert_active = True
-                        print("[DETECTOR] Covert channel START detected")
+                        is_start_packet = True
+                        detected_by_payload = True
                     elif payload == b"END":
-                        self.covert_active = False
-                        print("[DETECTOR] Covert channel END detected")
-                    
-                    if payload in [b"START", b"HEADER", b"DATA", b"END"]:
-                        detected = True
-                
-                # Basit detection logic
+                        is_end_packet = True
+                        detected_by_payload = True
+                    elif payload in [b"HEADER", b"DATA"]:
+                        detected_by_payload = True
+
+                # --- 2. Tespit Aşaması ---
+                detected_by_stats = False
                 if len(self.tos_history) >= 20:
-                    # Entropy kontrolü
                     entropy = self.calculate_entropy(list(self.tos_history))
-                    # Variance kontrolü  
                     variance = self.calculate_variance(list(self.tos_history))
-                    # Unusual TOS kontrolü
-                    unusual = sum(1 for t in list(self.tos_history)[-20:] if t != 0)
-                    
+                    unusual = sum(1 for t in self.tos_history if t != 0)
                     if entropy > 0.3 or variance > 5 or unusual > 10:
-                        detected = True
+                        detected_by_stats = True
                 
-                # Metrikleri güncelle
-                if detected and self.covert_active:
+                detected = detected_by_payload or detected_by_stats
+                
+                # --- 3. Sınıflandırma Aşaması (Metrikleri Güncelle) ---
+                # Bir paket, kanal zaten aktifse VEYA kanalı başlatan START paketi ise True Positive'dir.
+                if detected and (self.covert_active or is_start_packet):
                     self.metrics["tp"] += 1
                 elif detected and not self.covert_active:
                     self.metrics["fp"] += 1
                 elif not detected and self.covert_active:
                     self.metrics["fn"] += 1
-                else:
+                else: # not detected and not self.covert_active
                     self.metrics["tn"] += 1
-                
+
+                # --- 4. Durum Güncelleme Aşaması ---
+                # Metrikler güncellendikten SONRA, bir sonraki paket için durumu güncelle.
+                if is_start_packet:
+                    self.covert_active = True
+                    print("[DETECTOR] Covert channel START detected")
+                elif is_end_packet:
+                    self.covert_active = False
+                    print("[DETECTOR] Covert channel END detected")
+
                 if detected:
                     print(f"[ALERT] Covert channel detected! TOS={tos}")
             
